@@ -28,8 +28,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/logger"
-	"github.com/ethereum/go-ethereum/logger/glog"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/errors"
@@ -43,6 +42,7 @@ var (
 	nodeDBNilNodeID      = NodeID{}       // Special node ID to use as a nil element.
 	nodeDBNodeExpiration = 24 * time.Hour // Time after which an unseen node should be dropped.
 	nodeDBCleanupCycle   = time.Hour      // Time period for running the expiration task.
+	nodeDBVersion        = 5
 )
 
 // nodeDB stores all nodes we know about.
@@ -180,12 +180,11 @@ func (db *nodeDB) storeInt64(key []byte, n int64) error {
 func (db *nodeDB) node(id NodeID) *Node {
 	blob, err := db.lvl.Get(makeKey(id, nodeDBDiscoverRoot), nil)
 	if err != nil {
-		glog.V(logger.Detail).Infof("failed to retrieve node %v: %v", id, err)
 		return nil
 	}
 	node := new(Node)
 	if err := rlp.DecodeBytes(blob, node); err != nil {
-		glog.V(logger.Warn).Infof("failed to decode node RLP: %v", err)
+		log.Error("Failed to decode node RLP", "err", err)
 		return nil
 	}
 	node.sha = crypto.Keccak256Hash(node.ID[:])
@@ -228,14 +227,14 @@ func (db *nodeDB) ensureExpirer() {
 // expirer should be started in a go routine, and is responsible for looping ad
 // infinitum and dropping stale data from the database.
 func (db *nodeDB) expirer() {
-	tick := time.Tick(nodeDBCleanupCycle)
+	tick := time.NewTicker(nodeDBCleanupCycle)
+	defer tick.Stop()
 	for {
 		select {
-		case <-tick:
+		case <-tick.C:
 			if err := db.expireNodes(); err != nil {
-				glog.V(logger.Error).Infof("Failed to expire nodedb items: %v", err)
+				log.Error("Failed to expire nodedb items", "err", err)
 			}
-
 		case <-db.quit:
 			return
 		}
@@ -259,7 +258,7 @@ func (db *nodeDB) expireNodes() error {
 		}
 		// Skip the node if not expired yet (and not self)
 		if !bytes.Equal(id[:], db.self[:]) {
-			if seen := db.lastPong(id); seen.After(threshold) {
+			if seen := db.lastPongReceived(id); seen.After(threshold) {
 				continue
 			}
 		}
@@ -269,24 +268,28 @@ func (db *nodeDB) expireNodes() error {
 	return nil
 }
 
-// lastPing retrieves the time of the last ping packet send to a remote node,
-// requesting binding.
-func (db *nodeDB) lastPing(id NodeID) time.Time {
+// lastPingReceived retrieves the time of the last ping packet sent by the remote node.
+func (db *nodeDB) lastPingReceived(id NodeID) time.Time {
 	return time.Unix(db.fetchInt64(makeKey(id, nodeDBDiscoverPing)), 0)
 }
 
-// updateLastPing updates the last time we tried contacting a remote node.
-func (db *nodeDB) updateLastPing(id NodeID, instance time.Time) error {
+// updateLastPing updates the last time remote node pinged us.
+func (db *nodeDB) updateLastPingReceived(id NodeID, instance time.Time) error {
 	return db.storeInt64(makeKey(id, nodeDBDiscoverPing), instance.Unix())
 }
 
-// lastPong retrieves the time of the last successful contact from remote node.
-func (db *nodeDB) lastPong(id NodeID) time.Time {
+// lastPongReceived retrieves the time of the last successful pong from remote node.
+func (db *nodeDB) lastPongReceived(id NodeID) time.Time {
 	return time.Unix(db.fetchInt64(makeKey(id, nodeDBDiscoverPong)), 0)
 }
 
-// updateLastPong updates the last time a remote node successfully contacted.
-func (db *nodeDB) updateLastPong(id NodeID, instance time.Time) error {
+// hasBond reports whether the given node is considered bonded.
+func (db *nodeDB) hasBond(id NodeID) bool {
+	return time.Since(db.lastPongReceived(id)) < nodeDBNodeExpiration
+}
+
+// updateLastPongReceived updates the last pong time of a node.
+func (db *nodeDB) updateLastPongReceived(id NodeID, instance time.Time) error {
 	return db.storeInt64(makeKey(id, nodeDBDiscoverPong), instance.Unix())
 }
 
@@ -329,7 +332,7 @@ seek:
 		if n.ID == db.self {
 			continue seek
 		}
-		if now.Sub(db.lastPong(n.ID)) > maxAge {
+		if now.Sub(db.lastPongReceived(n.ID)) > maxAge {
 			continue seek
 		}
 		for i := range nodes {
@@ -352,9 +355,7 @@ func nextNode(it iterator.Iterator) *Node {
 		}
 		var n Node
 		if err := rlp.DecodeBytes(it.Value(), &n); err != nil {
-			if glog.V(logger.Warn) {
-				glog.Errorf("invalid node %x: %v", id, err)
-			}
+			log.Warn("Failed to decode node RLP", "id", id, "err", err)
 			continue
 		}
 		return &n

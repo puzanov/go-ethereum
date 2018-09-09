@@ -17,27 +17,24 @@
 package rpc
 
 import (
+	"context"
 	"net"
 
-	"github.com/ethereum/go-ethereum/logger"
-	"github.com/ethereum/go-ethereum/logger/glog"
-	"golang.org/x/net/context"
+	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/p2p/netutil"
 )
-
-// CreateIPCListener creates an listener, on Unix platforms this is a unix socket, on
-// Windows this is a named pipe
-func CreateIPCListener(endpoint string) (net.Listener, error) {
-	return ipcListen(endpoint)
-}
 
 // ServeListener accepts connections on l, serving JSON-RPC on them.
 func (srv *Server) ServeListener(l net.Listener) error {
 	for {
 		conn, err := l.Accept()
-		if err != nil {
+		if netutil.IsTemporaryError(err) {
+			log.Warn("RPC accept error", "err", err)
+			continue
+		} else if err != nil {
 			return err
 		}
-		glog.V(logger.Detail).Infoln("accepted conn", conn.RemoteAddr())
+		log.Trace("Accepted connection", "addr", conn.RemoteAddr())
 		go srv.ServeCodec(NewJSONCodec(conn), OptionMethodInvocation|OptionSubscriptions)
 	}
 }

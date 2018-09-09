@@ -35,8 +35,8 @@ var (
 
 func testNodeConfig() *Config {
 	return &Config{
-		PrivateKey: testNodeKey,
-		Name:       "test node",
+		Name: "test node",
+		P2P:  p2p.Config{PrivateKey: testNodeKey},
 	}
 }
 
@@ -507,8 +507,8 @@ func TestAPIGather(t *testing.T) {
 	}
 	// Register a batch of services with some configured APIs
 	calls := make(chan string, 1)
-	makeAPI := func(result string) *OneMethodApi {
-		return &OneMethodApi{fun: func() { calls <- result }}
+	makeAPI := func(result string) *OneMethodAPI {
+		return &OneMethodAPI{fun: func() { calls <- result }}
 	}
 	services := map[string]struct {
 		APIs  []rpc.API

@@ -18,33 +18,37 @@ package api
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/logger"
-	"github.com/ethereum/go-ethereum/logger/glog"
+	"github.com/ethereum/go-ethereum/swarm/log"
 	"github.com/ethereum/go-ethereum/swarm/storage"
 )
 
 const maxParallelFiles = 5
 
 type FileSystem struct {
-	api *Api
+	api *API
 }
 
-func NewFileSystem(api *Api) *FileSystem {
+func NewFileSystem(api *API) *FileSystem {
 	return &FileSystem{api}
 }
 
 // Upload replicates a local directory as a manifest file and uploads it
-// using dpa store
+// using FileStore store
+// This function waits the chunks to be stored.
 // TODO: localpath should point to a manifest
-func (self *FileSystem) Upload(lpath, index string) (string, error) {
+//
+// DEPRECATED: Use the HTTP API instead
+func (fs *FileSystem) Upload(lpath, index string, toEncrypt bool) (string, error) {
 	var list []*manifestTrieEntry
 	localpath, err := filepath.Abs(filepath.Clean(lpath))
 	if err != nil {
@@ -63,19 +67,16 @@ func (self *FileSystem) Upload(lpath, index string) (string, error) {
 	var start int
 	if stat.IsDir() {
 		start = len(localpath)
-		glog.V(logger.Debug).Infof("uploading '%s'", localpath)
+		log.Debug(fmt.Sprintf("uploading '%s'", localpath))
 		err = filepath.Walk(localpath, func(path string, info os.FileInfo, err error) error {
 			if (err == nil) && !info.IsDir() {
-				//fmt.Printf("lp %s  path %s\n", localpath, path)
 				if len(path) <= start {
 					return fmt.Errorf("Path is too short")
 				}
 				if path[:start] != localpath {
 					return fmt.Errorf("Path prefix of '%s' does not match localpath '%s'", path, localpath)
 				}
-				entry := &manifestTrieEntry{
-					Path: filepath.ToSlash(path),
-				}
+				entry := newManifestTrieEntry(&ManifestEntry{Path: filepath.ToSlash(path)}, nil)
 				list = append(list, entry)
 			}
 			return err
@@ -92,9 +93,7 @@ func (self *FileSystem) Upload(lpath, index string) (string, error) {
 		if localpath[:start] != dir {
 			return "", fmt.Errorf("Path prefix of '%s' does not match dir '%s'", localpath, dir)
 		}
-		entry := &manifestTrieEntry{
-			Path: filepath.ToSlash(localpath),
-		}
+		entry := newManifestTrieEntry(&ManifestEntry{Path: filepath.ToSlash(localpath)}, nil)
 		list = append(list, entry)
 	}
 
@@ -114,13 +113,14 @@ func (self *FileSystem) Upload(lpath, index string) (string, error) {
 			f, err := os.Open(entry.Path)
 			if err == nil {
 				stat, _ := f.Stat()
-				var hash storage.Key
-				wg := &sync.WaitGroup{}
-				hash, err = self.api.dpa.Store(f, stat.Size(), wg, nil)
+				var hash storage.Address
+				var wait func(context.Context) error
+				ctx := context.TODO()
+				hash, wait, err = fs.api.fileStore.Store(ctx, f, stat.Size(), toEncrypt)
 				if hash != nil {
-					list[i].Hash = hash.String()
+					list[i].Hash = hash.Hex()
 				}
-				wg.Wait()
+				err = wait(ctx)
 				awg.Done()
 				if err == nil {
 					first512 := make([]byte, 512)
@@ -145,7 +145,7 @@ func (self *FileSystem) Upload(lpath, index string) (string, error) {
 	}
 
 	trie := &manifestTrie{
-		dpa: self.api.dpa,
+		fileStore: fs.api.fileStore,
 	}
 	quitC := make(chan bool)
 	for i, entry := range list {
@@ -154,11 +154,10 @@ func (self *FileSystem) Upload(lpath, index string) (string, error) {
 		}
 		entry.Path = RegularSlashes(entry.Path[start:])
 		if entry.Path == index {
-			ientry := &manifestTrieEntry{
-				Path:        "",
-				Hash:        entry.Hash,
+			ientry := newManifestTrieEntry(&ManifestEntry{
 				ContentType: entry.ContentType,
-			}
+			}, nil)
+			ientry.Hash = entry.Hash
 			trie.addEntry(ientry, quitC)
 		}
 		trie.addEntry(entry, quitC)
@@ -167,15 +166,17 @@ func (self *FileSystem) Upload(lpath, index string) (string, error) {
 	err2 := trie.recalcAndStore()
 	var hs string
 	if err2 == nil {
-		hs = trie.hash.String()
+		hs = trie.ref.Hex()
 	}
 	awg.Wait()
 	return hs, err2
 }
 
-// Download replicates the manifest path structure on the local filesystem
+// Download replicates the manifest basePath structure on the local filesystem
 // under localpath
-func (self *FileSystem) Download(bzzpath, localpath string) error {
+//
+// DEPRECATED: Use the HTTP API instead
+func (fs *FileSystem) Download(bzzpath, localpath string) error {
 	lpath, err := filepath.Abs(filepath.Clean(localpath))
 	if err != nil {
 		return err
@@ -186,24 +187,29 @@ func (self *FileSystem) Download(bzzpath, localpath string) error {
 	}
 
 	//resolving host and port
-	key, _, path, err := self.api.parseAndResolve(bzzpath, true)
+	uri, err := Parse(path.Join("bzz:/", bzzpath))
 	if err != nil {
 		return err
 	}
+	addr, err := fs.api.Resolve(context.TODO(), uri.Addr)
+	if err != nil {
+		return err
+	}
+	path := uri.Path
 
 	if len(path) > 0 {
 		path += "/"
 	}
 
 	quitC := make(chan bool)
-	trie, err := loadManifest(self.api.dpa, key, quitC)
+	trie, err := loadManifest(context.TODO(), fs.api.fileStore, addr, quitC, NOOPDecrypt)
 	if err != nil {
-		glog.V(logger.Warn).Infof("fs.Download: loadManifestTrie error: %v", err)
+		log.Warn(fmt.Sprintf("fs.Download: loadManifestTrie error: %v", err))
 		return err
 	}
 
 	type downloadListEntry struct {
-		key  storage.Key
+		addr storage.Address
 		path string
 	}
 
@@ -212,9 +218,9 @@ func (self *FileSystem) Download(bzzpath, localpath string) error {
 
 	prevPath := lpath
 	err = trie.listWithPrefix(path, quitC, func(entry *manifestTrieEntry, suffix string) {
-		glog.V(logger.Detail).Infof("fs.Download: %#v", entry)
+		log.Trace(fmt.Sprintf("fs.Download: %#v", entry))
 
-		key = common.Hex2Bytes(entry.Hash)
+		addr = common.Hex2Bytes(entry.Hash)
 		path := lpath + "/" + suffix
 		dir := filepath.Dir(path)
 		if dir != prevPath {
@@ -222,7 +228,7 @@ func (self *FileSystem) Download(bzzpath, localpath string) error {
 			prevPath = dir
 		}
 		if (mde == nil) && (path != dir+"/") {
-			list = append(list, &downloadListEntry{key: key, path: path})
+			list = append(list, &downloadListEntry{addr: addr, path: path})
 		}
 	})
 	if err != nil {
@@ -241,7 +247,7 @@ func (self *FileSystem) Download(bzzpath, localpath string) error {
 		}
 		go func(i int, entry *downloadListEntry) {
 			defer wg.Done()
-			err := retrieveToFile(quitC, self.api.dpa, entry.key, entry.path)
+			err := retrieveToFile(quitC, fs.api.fileStore, entry.addr, entry.path)
 			if err != nil {
 				select {
 				case errC <- err:
@@ -264,14 +270,14 @@ func (self *FileSystem) Download(bzzpath, localpath string) error {
 	}
 }
 
-func retrieveToFile(quitC chan bool, dpa *storage.DPA, key storage.Key, path string) error {
-	f, err := os.Create(path) // TODO: path separators
+func retrieveToFile(quitC chan bool, fileStore *storage.FileStore, addr storage.Address, path string) error {
+	f, err := os.Create(path) // TODO: basePath separators
 	if err != nil {
 		return err
 	}
-	reader := dpa.Retrieve(key)
+	reader, _ := fileStore.Retrieve(context.TODO(), addr)
 	writer := bufio.NewWriter(f)
-	size, err := reader.Size(quitC)
+	size, err := reader.Size(context.TODO(), quitC)
 	if err != nil {
 		return err
 	}

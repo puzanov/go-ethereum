@@ -20,19 +20,22 @@
 package geth
 
 import (
+	"encoding/json"
 	"fmt"
-	"math/big"
 	"path/filepath"
 
-	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/eth"
+	"github.com/ethereum/go-ethereum/eth/downloader"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/ethstats"
+	"github.com/ethereum/go-ethereum/internal/debug"
 	"github.com/ethereum/go-ethereum/les"
 	"github.com/ethereum/go-ethereum/node"
+	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/nat"
 	"github.com/ethereum/go-ethereum/params"
-	"github.com/ethereum/go-ethereum/whisper/whisperv2"
+	whisper "github.com/ethereum/go-ethereum/whisper/whisperv6"
 )
 
 // NodeConfig represents the collection of configuration values to fine tune the Geth
@@ -52,11 +55,7 @@ type NodeConfig struct {
 
 	// EthereumNetworkID is the network identifier used by the Ethereum protocol to
 	// decide if remote peers should be accepted or not.
-	EthereumNetworkID int
-
-	// EthereumChainConfig is the default parameters of the blockchain to use. If no
-	// configuration is specified, it defaults to the main network.
-	EthereumChainConfig *ChainConfig
+	EthereumNetworkID int64 // uint64 in truth, but Java can't handle that...
 
 	// EthereumGenesis is the genesis JSON to use to seed the blockchain with. An
 	// empty genesis state is equivalent to using the mainnet's state.
@@ -74,6 +73,9 @@ type NodeConfig struct {
 
 	// WhisperEnabled specifies whether the node should run the Whisper protocol.
 	WhisperEnabled bool
+
+	// Listening address of pprof server.
+	PprofAddress string
 }
 
 // defaultNodeConfig contains the default node configuration values to use if all
@@ -83,7 +85,6 @@ var defaultNodeConfig = &NodeConfig{
 	MaxPeers:              25,
 	EthereumEnabled:       true,
 	EthereumNetworkID:     1,
-	EthereumChainConfig:   MainnetChainConfig(),
 	EthereumDatabaseCache: 16,
 }
 
@@ -110,51 +111,57 @@ func NewNode(datadir string, config *NodeConfig) (stack *Node, _ error) {
 	if config.BootstrapNodes == nil || config.BootstrapNodes.Size() == 0 {
 		config.BootstrapNodes = defaultNodeConfig.BootstrapNodes
 	}
+
+	if config.PprofAddress != "" {
+		debug.StartPProf(config.PprofAddress)
+	}
+
 	// Create the empty networking stack
 	nodeConf := &node.Config{
-		Name:             clientIdentifier,
-		Version:          params.Version,
-		DataDir:          datadir,
-		KeyStoreDir:      filepath.Join(datadir, "keystore"), // Mobile should never use internal keystores!
-		NoDiscovery:      true,
-		DiscoveryV5:      true,
-		DiscoveryV5Addr:  ":0",
-		BootstrapNodesV5: config.BootstrapNodes.nodes,
-		ListenAddr:       ":0",
-		NAT:              nat.Any(),
-		MaxPeers:         config.MaxPeers,
+		Name:        clientIdentifier,
+		Version:     params.VersionWithMeta,
+		DataDir:     datadir,
+		KeyStoreDir: filepath.Join(datadir, "keystore"), // Mobile should never use internal keystores!
+		P2P: p2p.Config{
+			NoDiscovery:      true,
+			DiscoveryV5:      true,
+			BootstrapNodesV5: config.BootstrapNodes.nodes,
+			ListenAddr:       ":0",
+			NAT:              nat.Any(),
+			MaxPeers:         config.MaxPeers,
+		},
 	}
 	rawStack, err := node.New(nodeConf)
 	if err != nil {
 		return nil, err
 	}
+
+	debug.Memsize.Add("node", rawStack)
+
+	var genesis *core.Genesis
+	if config.EthereumGenesis != "" {
+		// Parse the user supplied genesis spec if not mainnet
+		genesis = new(core.Genesis)
+		if err := json.Unmarshal([]byte(config.EthereumGenesis), genesis); err != nil {
+			return nil, fmt.Errorf("invalid genesis spec: %v", err)
+		}
+		// If we have the testnet, hard code the chain configs too
+		if config.EthereumGenesis == TestnetGenesis() {
+			genesis.Config = params.TestnetChainConfig
+			if config.EthereumNetworkID == 1 {
+				config.EthereumNetworkID = 3
+			}
+		}
+	}
 	// Register the Ethereum protocol if requested
 	if config.EthereumEnabled {
-		ethConf := &eth.Config{
-			ChainConfig: &params.ChainConfig{
-				ChainId:        big.NewInt(config.EthereumChainConfig.ChainID),
-				HomesteadBlock: big.NewInt(config.EthereumChainConfig.HomesteadBlock),
-				DAOForkBlock:   big.NewInt(config.EthereumChainConfig.DAOForkBlock),
-				DAOForkSupport: config.EthereumChainConfig.DAOForkSupport,
-				EIP150Block:    big.NewInt(config.EthereumChainConfig.EIP150Block),
-				EIP150Hash:     config.EthereumChainConfig.EIP150Hash.hash,
-				EIP155Block:    big.NewInt(config.EthereumChainConfig.EIP155Block),
-				EIP158Block:    big.NewInt(config.EthereumChainConfig.EIP158Block),
-			},
-			Genesis:                 config.EthereumGenesis,
-			LightMode:               true,
-			DatabaseCache:           config.EthereumDatabaseCache,
-			NetworkId:               config.EthereumNetworkID,
-			GasPrice:                new(big.Int).Mul(big.NewInt(20), common.Shannon),
-			GpoMinGasPrice:          new(big.Int).Mul(big.NewInt(20), common.Shannon),
-			GpoMaxGasPrice:          new(big.Int).Mul(big.NewInt(500), common.Shannon),
-			GpoFullBlockRatio:       80,
-			GpobaseStepDown:         10,
-			GpobaseStepUp:           100,
-			GpobaseCorrectionFactor: 110,
-		}
+		ethConf := eth.DefaultConfig
+		ethConf.Genesis = genesis
+		ethConf.SyncMode = downloader.LightSync
+		ethConf.NetworkId = uint64(config.EthereumNetworkID)
+		ethConf.DatabaseCache = config.EthereumDatabaseCache
 		if err := rawStack.Register(func(ctx *node.ServiceContext) (node.Service, error) {
-			return les.New(ctx, ethConf)
+			return les.New(ctx, &ethConf)
 		}); err != nil {
 			return nil, fmt.Errorf("ethereum init: %v", err)
 		}
@@ -172,7 +179,9 @@ func NewNode(datadir string, config *NodeConfig) (stack *Node, _ error) {
 	}
 	// Register the Whisper protocol if requested
 	if config.WhisperEnabled {
-		if err := rawStack.Register(func(*node.ServiceContext) (node.Service, error) { return whisperv2.New(), nil }); err != nil {
+		if err := rawStack.Register(func(*node.ServiceContext) (node.Service, error) {
+			return whisper.New(&whisper.DefaultConfig), nil
+		}); err != nil {
 			return nil, fmt.Errorf("whisper init: %v", err)
 		}
 	}
@@ -184,7 +193,7 @@ func (n *Node) Start() error {
 	return n.node.Start()
 }
 
-// Stop terminates a running node along with all it's services. In the node was
+// Stop terminates a running node along with all it's services. If the node was
 // not started, an error is returned.
 func (n *Node) Stop() error {
 	return n.node.Stop()

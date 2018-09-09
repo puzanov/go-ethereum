@@ -39,8 +39,8 @@ func TestDefaults(t *testing.T) {
 	if cfg.Time == nil {
 		t.Error("expected time to be non nil")
 	}
-	if cfg.GasLimit == nil {
-		t.Error("expected time to be non nil")
+	if cfg.GasLimit == 0 {
+		t.Error("didn't expect gaslimit to be zero")
 	}
 	if cfg.GasPrice == nil {
 		t.Error("expected time to be non nil")
@@ -87,15 +87,14 @@ func TestExecute(t *testing.T) {
 		t.Fatal("didn't expect error", err)
 	}
 
-	num := common.BytesToBig(ret)
+	num := new(big.Int).SetBytes(ret)
 	if num.Cmp(big.NewInt(10)) != 0 {
 		t.Error("Expected 10, got", num)
 	}
 }
 
 func TestCall(t *testing.T) {
-	db, _ := ethdb.NewMemDatabase()
-	state, _ := state.New(common.Hash{}, db)
+	state, _ := state.New(common.Hash{}, state.NewDatabase(ethdb.NewMemDatabase()))
 	address := common.HexToAddress("0x0a")
 	state.SetCode(address, []byte{
 		byte(vm.PUSH1), 10,
@@ -106,12 +105,12 @@ func TestCall(t *testing.T) {
 		byte(vm.RETURN),
 	})
 
-	ret, err := Call(address, nil, &Config{State: state})
+	ret, _, err := Call(address, nil, &Config{State: state})
 	if err != nil {
 		t.Fatal("didn't expect error", err)
 	}
 
-	num := common.BytesToBig(ret)
+	num := new(big.Int).SetBytes(ret)
 	if num.Cmp(big.NewInt(10)) != 0 {
 		t.Error("Expected 10, got", num)
 	}
